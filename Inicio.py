@@ -21,6 +21,18 @@ DEFAULT_ORG = "Clase de computacion fisica"
 DEFAULT_BUCKET = "Sprout"
 MEASUREMENT = "tanque_planta"
 
+CAMPOS_OBJETIVO = [
+    "nivel_agua",
+    "humedad_suelo",
+    "nivel_raw",
+    "humedad_raw",
+    "estado_suelo",
+    "estado_nivel",
+    "alerta_nivel",
+    "alerta_humedad",
+    "valvula",
+]
+
 # Umbrales de humedad definidos en el firmware del ESP32.
 HUMEDAD_SECA = 20.0
 HUMEDAD_HUMEDA = 55.0
@@ -49,23 +61,108 @@ def crear_cliente(url, token, org):
     return InfluxDBClient(url=url, token=token, org=org, timeout=15000)
 
 
+def normalizar_dataframe(df: pd.DataFrame) -> pd.DataFrame:
+    if df is None or df.empty:
+        return pd.DataFrame()
+
+    df = df.loc[:, ~df.columns.duplicated()].copy()
+
+    # Detectar columna de tiempo común en InfluxDB y Grafana
+    time_candidates = ["_time", "Time", "time", "timestamp", "@timestamp"]
+    col_tiempo = next((c for c in time_candidates if c in df.columns), None)
+    if col_tiempo is not None:
+        # Si viene en milisegundos o segundos numéricos, convertir adecuadamente
+        if pd.api.types.is_numeric_dtype(df[col_tiempo]):
+            max_val = df[col_tiempo].dropna().max() if not df[col_tiempo].dropna().empty else 0
+            unit = "ms" if max_val > 1e12 else "s"
+            df["_time"] = pd.to_datetime(df[col_tiempo], unit=unit, errors="coerce", utc=True)
+        else:
+            df["_time"] = pd.to_datetime(df[col_tiempo], errors="coerce", utc=True)
+        df = df.dropna(subset=["_time"]).sort_values("_time")
+
+    for col in ["nivel_agua", "humedad_suelo", "nivel_raw", "humedad_raw", "valvula"]:
+        if col in df.columns:
+            if df[col].dtype == object:
+                limpio = (
+                    df[col]
+                    .astype(str)
+                    .str.replace("%", "", regex=False)
+                    .str.replace(",", ".", regex=False)
+                    .str.strip()
+                )
+                df[col] = pd.to_numeric(limpio, errors="coerce")
+            else:
+                df[col] = pd.to_numeric(df[col], errors="coerce")
+
+    return df.reset_index(drop=True)
+
+
+def mapear_nombre_campo(nombre_col: str):
+    """Intenta asociar nombres de columnas exportadas por Grafana con los campos del sistema."""
+    limpio = str(nombre_col).strip()
+    if limpio in CAMPOS_OBJETIVO:
+        return limpio
+
+    # Ejemplos típicos en Grafana: "tanque_planta.humedad_suelo" o "humedad_suelo {bucket=\"Sprout\"}"
+    base = limpio.split("{")[0].strip()
+    if "." in base:
+        base = base.split(".")[-1].strip()
+    if base in CAMPOS_OBJETIVO:
+        return base
+
+    for campo in CAMPOS_OBJETIVO:
+        if campo in limpio.lower():
+            return campo
+    return None
+
+
+def cargar_csv_grafana(archivo_subido) -> pd.DataFrame:
+    """Lee un CSV exportado desde Grafana (formato ancho o largo) y lo normaliza."""
+    df_raw = pd.read_csv(archivo_subido, sep=None, engine="python")
+    if df_raw is None or df_raw.empty:
+        return pd.DataFrame()
+
+    time_candidates = ["_time", "Time", "time", "timestamp", "@timestamp"]
+    col_tiempo = next((c for c in time_candidates if c in df_raw.columns), None)
+
+    # Caso 1: Formato largo (p. ej. columnas de tiempo + serie/campo + valor)
+    serie_candidates = ["_field", "Metric", "metric", "Field", "field", "Series", "series", "name"]
+    valor_candidates = ["_value", "Value", "value"]
+    col_serie = next((c for c in serie_candidates if c in df_raw.columns), None)
+    col_valor = next((c for c in valor_candidates if c in df_raw.columns), None)
+
+    if col_tiempo and col_serie and col_valor:
+        temp = df_raw[[col_tiempo, col_serie, col_valor]].copy()
+        temp["_campo_mapeado"] = temp[col_serie].apply(mapear_nombre_campo)
+        temp = temp.dropna(subset=["_campo_mapeado"])
+        if temp.empty:
+            return pd.DataFrame()
+        pivote = temp.pivot_table(
+            index=col_tiempo,
+            columns="_campo_mapeado",
+            values=col_valor,
+            aggfunc="last",
+        ).reset_index()
+        return normalizar_dataframe(pivote)
+
+    # Caso 2: Formato ancho (cada serie/campo en su columna)
+    renombrar = {}
+    for col in df_raw.columns:
+        campo = mapear_nombre_campo(col)
+        if campo and campo not in df_raw.columns and campo not in renombrar.values():
+            renombrar[col] = campo
+    df_ancho = df_raw.rename(columns=renombrar)
+    return normalizar_dataframe(df_ancho)
+
+
 def consultar_influx(url, token, org, bucket, periodo):
     cliente = crear_cliente(url, token, org)
+    campos_flux = " or ".join([f'r["_field"] == "{c}"' for c in CAMPOS_OBJETIVO])
     flux = f"""
 from(bucket: "{bucket}")
     |> range(start: -{periodo})
     |> filter(fn: (r) => r["_measurement"] == "{MEASUREMENT}")
-    |> filter(fn: (r) =>
-        r["_field"] == "nivel_agua" or
-        r["_field"] == "humedad_suelo" or
-        r["_field"] == "nivel_raw" or
-        r["_field"] == "humedad_raw" or
-        r["_field"] == "estado_suelo" or
-        r["_field"] == "estado_nivel" or
-        r["_field"] == "alerta_nivel" or
-        r["_field"] == "alerta_humedad" or
-        r["_field"] == "valvula"
-    )
+    |> filter(fn: (r) => {campos_flux})
     |> pivot(rowKey: ["_time"], columnKey: ["_field"], valueColumn: "_value")
     |> sort(columns: ["_time"])
 """
@@ -77,16 +174,7 @@ from(bucket: "{bucket}")
         df = pd.concat(frames, ignore_index=True)
     else:
         df = resultado
-    if df is None or df.empty:
-        return pd.DataFrame()
-    df = df.loc[:, ~df.columns.duplicated()].copy()
-    if "_time" in df.columns:
-        df["_time"] = pd.to_datetime(df["_time"], errors="coerce", utc=True)
-        df = df.dropna(subset=["_time"]).sort_values("_time")
-    for col in ["nivel_agua", "humedad_suelo", "nivel_raw", "humedad_raw"]:
-        if col in df.columns:
-            df[col] = pd.to_numeric(df[col], errors="coerce")
-    return df.reset_index(drop=True)
+    return normalizar_dataframe(df)
 
 
 def interpretar_humedad(valor):
@@ -121,26 +209,41 @@ def mostrar_estado(titulo, estado, explicacion, icono, valor):
 st.title("🌱 Sistema inteligente de monitoreo de riego")
 st.write(
     "Panel de seguimiento e interpretación de la humedad del suelo y del nivel "
-    "de agua del tanque. Los datos se consultan directamente desde InfluxDB."
+    "de agua del tanque. Consulta datos en vivo desde InfluxDB o carga un CSV exportado desde Grafana."
 )
 
 url, org, bucket, token = obtener_configuracion()
 
 with st.sidebar:
     st.header("⚙️ Configuración")
-    periodo_label = st.selectbox(
-        "Periodo de consulta",
-        ["Última hora", "Últimas 6 horas", "Últimas 24 horas", "Últimos 7 días"],
-        index=2,
+    fuente_datos = st.radio(
+        "Fuente de datos",
+        ["InfluxDB", "CSV de Grafana"],
+        index=0,
     )
-    periodos = {
-        "Última hora": "1h",
-        "Últimas 6 horas": "6h",
-        "Últimas 24 horas": "24h",
-        "Últimos 7 días": "7d",
-    }
-    st.caption(f"Measurement: `{MEASUREMENT}`")
-    st.caption(f"Bucket: `{bucket}`")
+    st.divider()
+
+    if fuente_datos == "InfluxDB":
+        periodo_label = st.selectbox(
+            "Periodo de consulta",
+            ["Última hora", "Últimas 6 horas", "Últimas 24 horas", "Últimos 7 días"],
+            index=2,
+        )
+        periodos = {
+            "Última hora": "1h",
+            "Últimas 6 horas": "6h",
+            "Últimas 24 horas": "24h",
+            "Últimos 7 días": "7d",
+        }
+        st.caption(f"Measurement: `{MEASUREMENT}`")
+        st.caption(f"Bucket: `{bucket}`")
+    else:
+        archivo_csv = st.file_uploader(
+            "Sube el CSV exportado desde Grafana",
+            type=["csv"],
+            help="En Grafana: Inspect → Data → Download CSV",
+        )
+
     st.divider()
     st.subheader("Umbrales")
     st.write(f"Humedad seca: menos de {HUMEDAD_SECA:.0f} %")
@@ -149,36 +252,50 @@ with st.sidebar:
     st.write(f"Nivel bajo: menos de {NIVEL_BAJO:.0f} %")
     st.write(f"Nivel alto: desde {NIVEL_ALTO:.0f} %")
 
-if not token:
-    st.error("Falta el token de InfluxDB. Configúralo en `.streamlit/secrets.toml`.")
-    st.code(
-        f'INFLUXDB_URL = "{DEFAULT_URL}"\n'
-        f'INFLUXDB_ORG = "{DEFAULT_ORG}"\n'
-        f'INFLUXDB_BUCKET = "{DEFAULT_BUCKET}"\n'
-        'INFLUXDB_TOKEN = "PEGA_AQUI_UN_TOKEN_NUEVO"',
-        language="toml",
-    )
-    st.stop()
+if fuente_datos == "InfluxDB":
+    if not token:
+        st.error("Falta el token de InfluxDB. Configúralo en `.streamlit/secrets.toml` o cambia a **CSV de Grafana**.")
+        st.code(
+            f'INFLUXDB_URL = "{DEFAULT_URL}"\n'
+            f'INFLUXDB_ORG = "{DEFAULT_ORG}"\n'
+            f'INFLUXDB_BUCKET = "{DEFAULT_BUCKET}"\n'
+            'INFLUXDB_TOKEN = "PEGA_AQUI_UN_TOKEN_NUEVO"',
+            language="toml",
+        )
+        st.stop()
 
-col_refresh, col_info = st.columns([1, 3])
-with col_refresh:
-    actualizar = st.button("🔄 Actualizar datos", use_container_width=True)
-with col_info:
-    st.caption(f"Consulta: {periodo_label}. Actualiza para solicitar una consulta nueva.")
+    col_refresh, col_info = st.columns([1, 3])
+    with col_refresh:
+        actualizar = st.button("🔄 Actualizar datos", use_container_width=True)
+    with col_info:
+        st.caption(f"Consulta: {periodo_label}. Actualiza para solicitar una consulta nueva.")
 
-try:
-    if actualizar:
-        st.cache_resource.clear()
-    with st.spinner("Consultando InfluxDB..."):
-        df = consultar_influx(url, token, org, bucket, periodos[periodo_label])
-except Exception as error:
-    st.error("No fue posible consultar InfluxDB.")
-    st.exception(error)
-    st.info("Verifica URL, token, organización, bucket, conexión y envío de datos del ESP32.")
-    st.stop()
+    try:
+        if actualizar:
+            st.cache_resource.clear()
+        with st.spinner("Consultando InfluxDB..."):
+            df = consultar_influx(url, token, org, bucket, periodos[periodo_label])
+    except Exception as error:
+        st.error("No fue posible consultar InfluxDB.")
+        st.exception(error)
+        st.info("Verifica URL, token, organización, bucket, conexión y envío de datos del ESP32.")
+        st.stop()
+
+else:
+    if not archivo_csv:
+        st.info("Selecciona y sube un archivo **CSV exportado desde Grafana** en la barra lateral para analizarlo.")
+        st.stop()
+
+    try:
+        with st.spinner("Procesando CSV de Grafana..."):
+            df = cargar_csv_grafana(archivo_csv)
+    except Exception as error:
+        st.error("No fue posible leer o procesar el archivo CSV.")
+        st.exception(error)
+        st.stop()
 
 if df.empty:
-    st.warning("No hay mediciones en el periodo seleccionado. Comprueba que el ESP32 esté enviando datos.")
+    st.warning("No hay mediciones válidas en la fuente seleccionada.")
     st.stop()
 
 ultima = df.iloc[-1]
@@ -259,7 +376,7 @@ with st.expander("📊 Estadísticas del periodo"):
     if columnas:
         st.dataframe(df[columnas].describe().T.round(2), use_container_width=True)
 
-with st.expander("🔎 Registros recibidos desde InfluxDB"):
+with st.expander("🔎 Registros cargados"):
     visibles = [
         c for c in [
             "_time", "humedad_suelo", "nivel_agua", "estado_suelo",
@@ -275,4 +392,4 @@ with st.expander("🔎 Registros recibidos desde InfluxDB"):
     )
 
 st.divider()
-st.caption("Sistema de monitoreo de riego con ESP32 e InfluxDB. Las interpretaciones dependen de la calibración real de los sensores.")
+st.caption("Sistema de monitoreo de riego con ESP32 e InfluxDB/Grafana. Las interpretaciones dependen de la calibración real de los sensores.")
