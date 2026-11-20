@@ -1,251 +1,278 @@
+import os
 import pandas as pd
 import streamlit as st
+from influxdb_client import InfluxDBClient
 
-# ============================================================
-#  Configuración de la página
-# ============================================================
-st.set_page_config(
-    page_title="Análisis de Sensores - Mi Ciudad",
-    page_icon="📊",
-    layout="wide"
-)
-
+st.set_page_config(page_title="Sistema de riego inteligente", page_icon="🌱", layout="wide")
 st.markdown("""
-    <style>
-    .main { padding: 2rem; }
-    .stAlert { margin-top: 1rem; }
-    </style>
+<style>
+.block-container {padding-top: 1.5rem; padding-bottom: 2rem;}
+div[data-testid="stMetric"] {
+    background: rgba(128,128,128,0.08);
+    border: 1px solid rgba(128,128,128,0.18);
+    padding: 14px; border-radius: 12px;
+}
+</style>
 """, unsafe_allow_html=True)
 
-# Nombres que se reconocen como columna de tiempo (sin importar mayúsculas)
-CANDIDATAS_TIEMPO = ["time", "_time", "timestamp", "fecha", "date", "datetime"]
+# Configuración de InfluxDB. El token se lee desde secrets o una variable de entorno.
+DEFAULT_URL = "https://us-east-1-1.aws.cloud2.influxdata.com"
+DEFAULT_ORG = "Clase de computacion fisica"
+DEFAULT_BUCKET = "Sprout"
+MEASUREMENT = "tanque_planta"
+
+# Umbrales de humedad definidos en el firmware del ESP32.
+HUMEDAD_SECA = 20.0
+HUMEDAD_HUMEDA = 55.0
+
+# Umbrales provisionales del nivel del tanque. Ajustar tras calibrar el sensor.
+NIVEL_BAJO = 20.0
+NIVEL_ALTO = 60.0
 
 
-# ============================================================
-#  Preparación de datos
-# ============================================================
-def preparar_datos(df):
-    """Detecta la columna de tiempo y las columnas numéricas del CSV.
-
-    Devuelve el DataFrame procesado, la lista de variables numéricas
-    y el nombre original de la columna de tiempo (o None).
-    """
-    df = df.copy()
-
-    # 1. Columna de tiempo → índice
-    col_tiempo = next(
-        (c for c in df.columns if str(c).strip().lower() in CANDIDATAS_TIEMPO),
-        None
-    )
-    if col_tiempo is not None:
-        df[col_tiempo] = pd.to_datetime(df[col_tiempo], errors="coerce")
-        df = df.dropna(subset=[col_tiempo]).set_index(col_tiempo).sort_index()
-        df.index.name = "Time"
-
-    # 2. Columnas de texto que en realidad son números (p. ej. "23,5")
-    for c in df.columns:
-        # (pandas 3 usa StringDtype para texto, por eso no basta con dtype == object)
-        if not pd.api.types.is_numeric_dtype(df[c]):
-            convertida = pd.to_numeric(
-                df[c].astype(str).str.replace(",", ".", regex=False),
-                errors="coerce"
-            )
-            if convertida.notna().mean() >= 0.9:
-                df[c] = convertida
-
-    # 3. Variables numéricas disponibles para el análisis
-    numericas = df.select_dtypes(include="number").columns.tolist()
-    return df, numericas, col_tiempo
-
-
-def normalizar(df):
-    """Escala cada columna a 0–1 para comparar variables con unidades distintas."""
-    rango = (df.max() - df.min()).replace(0, 1)
-    return (df - df.min()) / rango
-
-
-# ============================================================
-#  Encabezado y mapa
-# ============================================================
-st.title("📊 Análisis de datos de Sensores en Mi Ciudad")
-st.markdown("""
-    Esta aplicación permite analizar datos de sensores
-    recolectados en diferentes puntos de la ciudad.
-""")
-
-eafit_location = pd.DataFrame({
-    "lat": [6.2006],
-    "lon": [-75.5783],
-    "location": ["Universidad EAFIT"]
-})
-
-st.subheader("📍 Ubicación de los Sensores - Universidad EAFIT")
-st.map(eafit_location, zoom=15)
-
-# ============================================================
-#  Carga del archivo
-# ============================================================
-uploaded_file = st.file_uploader("Seleccione archivo CSV", type=["csv"])
-
-if uploaded_file is not None:
+def obtener_configuracion():
     try:
-        df_original = pd.read_csv(uploaded_file)
-        df1, variables, col_tiempo = preparar_datos(df_original)
+        url = st.secrets.get("INFLUXDB_URL", DEFAULT_URL)
+        org = st.secrets.get("INFLUXDB_ORG", DEFAULT_ORG)
+        bucket = st.secrets.get("INFLUXDB_BUCKET", DEFAULT_BUCKET)
+        token = st.secrets.get("INFLUXDB_TOKEN", os.getenv("INFLUXDB_TOKEN", ""))
+    except Exception:
+        url = os.getenv("INFLUXDB_URL", DEFAULT_URL)
+        org = os.getenv("INFLUXDB_ORG", DEFAULT_ORG)
+        bucket = os.getenv("INFLUXDB_BUCKET", DEFAULT_BUCKET)
+        token = os.getenv("INFLUXDB_TOKEN", "")
+    return url, org, bucket, token
 
-        if not variables:
-            st.error("No se encontraron columnas numéricas en el archivo.")
-            st.stop()
 
-        st.success(
-            f"Se detectaron **{len(variables)}** variable(s) numérica(s): "
-            + ", ".join(f"`{v}`" for v in variables)
-        )
-        if col_tiempo is None:
-            st.info("No se encontró columna de tiempo; se usará el número de registro como eje X.")
+@st.cache_resource
+def crear_cliente(url, token, org):
+    return InfluxDBClient(url=url, token=token, org=org, timeout=15000)
 
-        tab1, tab2, tab3, tab4 = st.tabs(
-            ["📈 Visualización", "📊 Estadísticas", "🔍 Filtros", "🗺️ Información del Sitio"]
-        )
 
-        # ----------------------------------------------------
-        #  TAB 1 · Visualización
-        # ----------------------------------------------------
-        with tab1:
-            st.subheader("Visualización de Datos")
+def consultar_influx(url, token, org, bucket, periodo):
+    cliente = crear_cliente(url, token, org)
+    flux = f"""
+from(bucket: "{bucket}")
+    |> range(start: -{periodo})
+    |> filter(fn: (r) => r["_measurement"] == "{MEASUREMENT}")
+    |> filter(fn: (r) =>
+        r["_field"] == "nivel_agua" or
+        r["_field"] == "humedad_suelo" or
+        r["_field"] == "nivel_raw" or
+        r["_field"] == "humedad_raw" or
+        r["_field"] == "estado_suelo" or
+        r["_field"] == "estado_nivel" or
+        r["_field"] == "alerta_nivel" or
+        r["_field"] == "alerta_humedad" or
+        r["_field"] == "valvula"
+    )
+    |> pivot(rowKey: ["_time"], columnKey: ["_field"], valueColumn: "_value")
+    |> sort(columns: ["_time"])
+"""
+    resultado = cliente.query_api().query_data_frame(query=flux, org=org)
+    if isinstance(resultado, list):
+        frames = [x for x in resultado if isinstance(x, pd.DataFrame) and not x.empty]
+        if not frames:
+            return pd.DataFrame()
+        df = pd.concat(frames, ignore_index=True)
+    else:
+        df = resultado
+    if df is None or df.empty:
+        return pd.DataFrame()
+    df = df.loc[:, ~df.columns.duplicated()].copy()
+    if "_time" in df.columns:
+        df["_time"] = pd.to_datetime(df["_time"], errors="coerce", utc=True)
+        df = df.dropna(subset=["_time"]).sort_values("_time")
+    for col in ["nivel_agua", "humedad_suelo", "nivel_raw", "humedad_raw"]:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+    return df.reset_index(drop=True)
 
-            col_a, col_b = st.columns([3, 1])
-            with col_a:
-                vars_graf = st.multiselect(
-                    "Variables a graficar",
-                    variables,
-                    default=variables if len(variables) <= 4 else variables[:2]
-                )
-            with col_b:
-                chart_type = st.selectbox("Tipo de gráfico", ["Línea", "Área", "Barra"])
 
-            normalizado = st.checkbox(
-                "Normalizar escalas (0–1)",
-                help="Útil para comparar variables con unidades distintas, "
-                     "por ejemplo temperatura (°C) y humedad (%)."
-            )
+def interpretar_humedad(valor):
+    if pd.isna(valor):
+        return "SIN DATOS", "No se recibió una medición válida de humedad."
+    if valor < HUMEDAD_SECA:
+        return "SECO", "El suelo tiene poca humedad. El sistema identifica una necesidad de riego."
+    if valor < HUMEDAD_HUMEDA:
+        return "INTERMEDIO", "El suelo conserva humedad, pero no alcanza el umbral configurado como húmedo."
+    return "HÚMEDO", "El suelo tiene humedad suficiente según el umbral configurado."
 
-            if not vars_graf:
-                st.warning("Seleccione al menos una variable.")
-            else:
-                datos_graf = df1[vars_graf]
-                if normalizado:
-                    datos_graf = normalizar(datos_graf)
 
-                if chart_type == "Línea":
-                    st.line_chart(datos_graf)
-                elif chart_type == "Área":
-                    st.area_chart(datos_graf)
-                else:
-                    st.bar_chart(datos_graf)
+def interpretar_nivel(valor):
+    if pd.isna(valor):
+        return "SIN DATOS", "No se recibió una medición válida del nivel de agua."
+    if valor < NIVEL_BAJO:
+        return "BAJO", "El tanque tiene poca agua. Conviene rellenarlo."
+    if valor < NIVEL_ALTO:
+        return "MEDIO", "El tanque tiene una reserva intermedia. Vigila su evolución."
+    return "ALTO", "El tanque tiene una reserva de agua alta."
 
-            if st.checkbox("Mostrar datos crudos"):
-                st.dataframe(df1)
 
-        # ----------------------------------------------------
-        #  TAB 2 · Estadísticas
-        # ----------------------------------------------------
-        with tab2:
-            st.subheader("Análisis Estadístico")
+def mostrar_estado(titulo, estado, explicacion, icono, valor):
+    st.markdown(f"### {icono} {titulo}")
+    st.markdown(f"**Estado: {estado}**")
+    st.write(explicacion)
+    if not pd.isna(valor):
+        st.progress(max(0.0, min(float(valor) / 100.0, 1.0)))
 
-            st.write("#### Resumen de todas las variables")
-            st.dataframe(df1[variables].describe().T.round(2))
 
-            st.write("#### Detalle por variable")
-            var_stats = st.selectbox("Variable", variables, key="var_stats")
-            serie = df1[var_stats].dropna()
+# ----------------------- Interfaz -----------------------
+st.title("🌱 Sistema inteligente de monitoreo de riego")
+st.write(
+    "Panel de seguimiento e interpretación de la humedad del suelo y del nivel "
+    "de agua del tanque. Los datos se consultan directamente desde InfluxDB."
+)
 
-            m1, m2, m3, m4 = st.columns(4)
-            m1.metric("Promedio", f"{serie.mean():.2f}")
-            m2.metric("Máximo", f"{serie.max():.2f}")
-            m3.metric("Mínimo", f"{serie.min():.2f}")
-            m4.metric("Desv. estándar", f"{serie.std():.2f}")
+url, org, bucket, token = obtener_configuracion()
 
-            if len(variables) >= 2:
-                st.write("#### Correlación entre variables")
-                st.dataframe(df1[variables].corr().round(2))
-                st.caption(
-                    "Valores cercanos a 1 o −1 indican una relación lineal fuerte; "
-                    "cercanos a 0, poca relación."
-                )
+with st.sidebar:
+    st.header("⚙️ Configuración")
+    periodo_label = st.selectbox(
+        "Periodo de consulta",
+        ["Última hora", "Últimas 6 horas", "Últimas 24 horas", "Últimos 7 días"],
+        index=2,
+    )
+    periodos = {
+        "Última hora": "1h",
+        "Últimas 6 horas": "6h",
+        "Últimas 24 horas": "24h",
+        "Últimos 7 días": "7d",
+    }
+    st.caption(f"Measurement: `{MEASUREMENT}`")
+    st.caption(f"Bucket: `{bucket}`")
+    st.divider()
+    st.subheader("Umbrales")
+    st.write(f"Humedad seca: menos de {HUMEDAD_SECA:.0f} %")
+    st.write(f"Humedad adecuada: desde {HUMEDAD_HUMEDA:.0f} %")
+    st.caption("Los umbrales del nivel del tanque son provisionales.")
+    st.write(f"Nivel bajo: menos de {NIVEL_BAJO:.0f} %")
+    st.write(f"Nivel alto: desde {NIVEL_ALTO:.0f} %")
 
-        # ----------------------------------------------------
-        #  TAB 3 · Filtros
-        # ----------------------------------------------------
-        with tab3:
-            st.subheader("Filtros de Datos")
+if not token:
+    st.error("Falta el token de InfluxDB. Configúralo en `.streamlit/secrets.toml`.")
+    st.code(
+        f'INFLUXDB_URL = "{DEFAULT_URL}"\n'
+        f'INFLUXDB_ORG = "{DEFAULT_ORG}"\n'
+        f'INFLUXDB_BUCKET = "{DEFAULT_BUCKET}"\n'
+        'INFLUXDB_TOKEN = "PEGA_AQUI_UN_TOKEN_NUEVO"',
+        language="toml",
+    )
+    st.stop()
 
-            var_filtro = st.selectbox("Variable a filtrar", variables, key="var_filtro")
-            min_value = float(df1[var_filtro].min())
-            max_value = float(df1[var_filtro].max())
+col_refresh, col_info = st.columns([1, 3])
+with col_refresh:
+    actualizar = st.button("🔄 Actualizar datos", use_container_width=True)
+with col_info:
+    st.caption(f"Consulta: {periodo_label}. Actualiza para solicitar una consulta nueva.")
 
-            if min_value == max_value:
-                st.warning(f"⚠️ Todos los valores de `{var_filtro}` son iguales: {min_value:.2f}")
-                st.info("No es posible aplicar filtros cuando no hay variación en los datos.")
-                st.dataframe(df1)
-            else:
-                rango = st.slider(
-                    f"Rango de {var_filtro}",
-                    min_value,
-                    max_value,
-                    (min_value, max_value),
-                    key=f"rango_{var_filtro}"
-                )
+try:
+    if actualizar:
+        st.cache_resource.clear()
+    with st.spinner("Consultando InfluxDB..."):
+        df = consultar_influx(url, token, org, bucket, periodos[periodo_label])
+except Exception as error:
+    st.error("No fue posible consultar InfluxDB.")
+    st.exception(error)
+    st.info("Verifica URL, token, organización, bucket, conexión y envío de datos del ESP32.")
+    st.stop()
 
-                filtrado = df1[df1[var_filtro].between(rango[0], rango[1])]
-                st.write(
-                    f"**{len(filtrado)}** de {len(df1)} registros con `{var_filtro}` "
-                    f"entre {rango[0]:.2f} y {rango[1]:.2f}:"
-                )
-                st.dataframe(filtrado)
+if df.empty:
+    st.warning("No hay mediciones en el periodo seleccionado. Comprueba que el ESP32 esté enviando datos.")
+    st.stop()
 
-                st.download_button(
-                    label="⬇️ Descargar datos filtrados (CSV)",
-                    data=filtrado.to_csv().encode("utf-8"),
-                    file_name=f"datos_filtrados_{var_filtro}.csv",
-                    mime="text/csv",
-                )
+ultima = df.iloc[-1]
+humedad = ultima.get("humedad_suelo", float("nan"))
+nivel = ultima.get("nivel_agua", float("nan"))
+valvula = ultima.get("valvula", None)
 
-        # ----------------------------------------------------
-        #  TAB 4 · Información del sitio
-        # ----------------------------------------------------
-        with tab4:
-            st.subheader("Información del Sitio de Medición")
+if pd.isna(humedad) and pd.isna(nivel):
+    st.error("Hay registros, pero no contienen los campos `humedad_suelo` ni `nivel_agua`.")
+    st.dataframe(df.tail())
+    st.stop()
 
-            col1, col2 = st.columns(2)
+hum_estado, hum_texto = interpretar_humedad(humedad)
+nivel_estado, nivel_texto = interpretar_nivel(nivel)
 
-            with col1:
-                st.write("### Ubicación del Sensor")
-                st.write("**Universidad EAFIT**")
-                st.write("- Latitud: 6.2006")
-                st.write("- Longitud: -75.5783")
-                st.write("- Altitud: ~1,495 metros sobre el nivel del mar")
+st.subheader("📍 Estado actual del sistema")
+m1, m2, m3 = st.columns(3)
+m1.metric("💧 Humedad del suelo", "Sin dato" if pd.isna(humedad) else f"{humedad:.1f} %")
+m2.metric("🛢️ Nivel del tanque", "Sin dato" if pd.isna(nivel) else f"{nivel:.1f} %")
 
-            with col2:
-                st.write("### Detalles del Sensor")
-                st.write("- Tipo: ESP32")
-                st.write("- Variables medidas: " + ", ".join(variables))
-                st.write(f"- Número de registros: {len(df1)}")
-                if col_tiempo is not None and len(df1) > 0:
-                    st.write(f"- Desde: {df1.index.min():%Y-%m-%d %H:%M}")
-                    st.write(f"- Hasta: {df1.index.max():%Y-%m-%d %H:%M}")
-                st.write("- Ubicación: Campus universitario")
-
-    except Exception as e:
-        st.error(f"Error al procesar el archivo: {str(e)}")
-        st.info("Asegúrese de que el archivo CSV tenga al menos una columna numérica.")
+if valvula is None or pd.isna(valvula):
+    valvula_texto = "Sin dato"
 else:
-    st.warning("Por favor, cargue un archivo CSV para comenzar el análisis.")
+    valvula_texto = "ABIERTA" if bool(int(valvula)) else "CERRADA"
+m3.metric("🚰 Válvula", valvula_texto)
 
-# ============================================================
-#  Pie de página
-# ============================================================
-st.markdown("""
-    ---
-    Desarrollado para el análisis de datos de sensores urbanos.
-    Ubicación: Universidad EAFIT, Medellín, Colombia
-""")
+if "_time" in ultima.index and pd.notna(ultima["_time"]):
+    st.caption(f"Última medición registrada: {ultima['_time']}")
+
+st.divider()
+st.subheader("🧠 Interpretación de las mediciones")
+c1, c2 = st.columns(2)
+with c1:
+    mostrar_estado("Humedad del suelo", hum_estado, hum_texto, "🌱", humedad)
+with c2:
+    mostrar_estado("Nivel del tanque", nivel_estado, nivel_texto, "🛢️", nivel)
+
+st.subheader("💡 Diagnóstico conjunto")
+if hum_estado == "SIN DATOS" or nivel_estado == "SIN DATOS":
+    st.warning("No hay suficientes mediciones para generar un diagnóstico conjunto.")
+elif hum_estado == "SECO" and nivel_estado == "BAJO":
+    st.error("El suelo necesita riego, pero el tanque tiene poca agua. Rellena el tanque y verifica la disponibilidad de agua.")
+elif hum_estado == "SECO":
+    st.warning("El suelo está seco y el tanque no está en nivel bajo. El firmware debería solicitar riego automático según sus umbrales.")
+elif nivel_estado == "BAJO":
+    st.warning("El tanque está bajo. Conviene rellenarlo para mantener disponible el sistema de riego.")
+elif hum_estado == "HÚMEDO":
+    st.success("El suelo presenta humedad suficiente y el tanque no está bajo. No se identifica una necesidad inmediata de riego.")
+else:
+    st.info("El suelo presenta humedad intermedia y el tanque tiene una reserva aceptable. Continúa monitoreando.")
+
+if valvula is not None and not pd.isna(valvula):
+    if bool(int(valvula)):
+        st.info("La telemetría indica que la válvula está ABIERTA. Esto no confirma por sí solo que exista caudal real de agua.")
+    else:
+        st.caption("La telemetría indica que la válvula está CERRADA.")
+
+# ----------------------- Histórico -----------------------
+st.divider()
+st.subheader("📈 Evolución de los sensores")
+disponibles = [
+    campo for campo in ["humedad_suelo", "nivel_agua"]
+    if campo in df.columns and df[campo].notna().any()
+]
+if disponibles and "_time" in df.columns:
+    historico = df.dropna(subset=["_time"]).set_index("_time")[disponibles]
+    historico = historico.rename(columns={
+        "humedad_suelo": "Humedad del suelo (%)",
+        "nivel_agua": "Nivel del tanque (%)",
+    })
+    st.line_chart(historico)
+    st.caption("Las dos variables están expresadas en porcentaje.")
+else:
+    st.info("No hay datos históricos suficientes para graficar.")
+
+with st.expander("📊 Estadísticas del periodo"):
+    columnas = [c for c in ["humedad_suelo", "nivel_agua", "humedad_raw", "nivel_raw"] if c in df.columns]
+    if columnas:
+        st.dataframe(df[columnas].describe().T.round(2), use_container_width=True)
+
+with st.expander("🔎 Registros recibidos desde InfluxDB"):
+    visibles = [
+        c for c in [
+            "_time", "humedad_suelo", "nivel_agua", "estado_suelo",
+            "estado_nivel", "valvula", "alerta_humedad", "alerta_nivel",
+        ] if c in df.columns
+    ]
+    st.dataframe(df[visibles].tail(500), use_container_width=True)
+    st.download_button(
+        "⬇️ Descargar mediciones CSV",
+        data=df.to_csv(index=False).encode("utf-8"),
+        file_name="mediciones_sistema_riego.csv",
+        mime="text/csv",
+    )
+
+st.divider()
+st.caption("Sistema de monitoreo de riego con ESP32 e InfluxDB. Las interpretaciones dependen de la calibración real de los sensores.")
