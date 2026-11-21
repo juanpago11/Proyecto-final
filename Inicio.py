@@ -1,5 +1,5 @@
+import io
 import re
-from pathlib import Path
 
 import numpy as np
 import pandas as pd
@@ -7,12 +7,9 @@ import altair as alt
 import streamlit as st
 
 # ============================================================
-#  Flujo: CirkitDesigner (ESP32) → InfluxDB → Grafana → CSV en GitHub → Streamlit
-#  El CSV exportado de Grafana se sube al repositorio con el nombre datos.csv
+#  Flujo: CirkitDesigner (ESP32) → InfluxDB → Grafana → CSV → Streamlit
+#  El CSV descargado de Grafana se sube o se pega en la app
 # ============================================================
-ARCHIVO_CSV = "datos.csv"
-CARPETA = Path(__file__).parent
-
 st.set_page_config(page_title="Sprout - Riego Inteligente", page_icon="💧", layout="wide")
 
 st.markdown("""
@@ -33,26 +30,17 @@ NIVEL_ALERTA_OFF = 29.18
 
 
 # ============================================================
-#  Lectura del CSV de Grafana que está en el repositorio
+#  Lectura del CSV de Grafana
 # ============================================================
-def buscar_csv():
-    """Usa datos.csv; si no existe, el CSV más reciente de la carpeta del repo."""
-    principal = CARPETA / ARCHIVO_CSV
-    if principal.exists():
-        return principal
-    otros = sorted(CARPETA.glob("*.csv"), key=lambda p: p.stat().st_mtime, reverse=True)
-    return otros[0] if otros else None
-
-
 def limpiar_nombre(columna):
     """Grafana nombra las series como 'tanque_planta humedad_suelo {device="ESP32"}'."""
     nombre = re.sub(r"\s*\{.*\}\s*$", "", str(columna)).strip()
     return re.split(r"[ .]", nombre)[-1] if nombre else nombre
 
 
-@st.cache_data(ttl=60)
-def leer_csv(ruta, _modificado):
-    df = pd.read_csv(ruta, sep=None, engine="python", comment="#")
+@st.cache_data
+def leer_csv(contenido: bytes):
+    df = pd.read_csv(io.BytesIO(contenido), sep=None, engine="python", comment="#")
     df = df.loc[:, ~df.columns.astype(str).str.startswith("Unnamed")]
 
     # Formato largo de InfluxDB (_time, _field, _value)
@@ -207,9 +195,9 @@ def grafico_con_umbrales(serie, titulo, umbrales, con_tiempo):
 # ============================================================
 st.title("💧 Sprout · Interpretación del sistema de riego")
 st.markdown("""
-    **Flujo de datos:** CirkitDesigner (ESP32) → InfluxDB → Grafana → CSV en GitHub → Streamlit.
-    La app lee el CSV exportado de Grafana que está en el repositorio, interpreta la
-    **humedad del suelo** y el **nivel de agua del tanque** y recomienda cuándo regar.
+    **Flujo de datos:** CirkitDesigner (ESP32) → InfluxDB → Grafana → CSV → Streamlit.
+    Suba o pegue el CSV descargado de Grafana: la app interpreta la **humedad del suelo**
+    y el **nivel de agua del tanque** y recomienda cuándo regar.
 """)
 
 st.sidebar.header("⚙️ Umbrales (iguales al ESP32)")
@@ -221,15 +209,15 @@ niv_on, niv_off = st.sidebar.slider(
 )
 
 
-def main(ruta):
-    df1, variables, col_tiempo = preparar_datos(leer_csv(str(ruta), ruta.stat().st_mtime))
+def main(df_crudo, origen):
+    df1, variables, col_tiempo = preparar_datos(df_crudo)
     con_tiempo = col_tiempo is not None
 
-    if not variables:
-        st.error("El CSV no tiene columnas numéricas.")
+    if df1.empty or not variables:
+        st.error("El CSV no tiene datos numéricos.")
         return
 
-    st.success(f"Datos de **{ruta.name}** · **{len(df1)}** registros · variables: "
+    st.success(f"Datos de **{origen}** · **{len(df1)}** registros · variables: "
                + ", ".join(f"`{v}`" for v in variables))
 
     st.sidebar.header("🔌 Columnas del CSV")
@@ -252,7 +240,7 @@ def main(ruta):
         ultimo = validos.iloc[-1]
         anterior = validos.iloc[-2] if len(validos) > 1 else ultimo
 
-        st.subheader("Estado actual")
+        st.subheader("Estado en la última lectura")
         st.caption(f"Última lectura: {validos.index[-1]:%Y-%m-%d %H:%M}" if con_tiempo
                    else f"Última lectura: registro #{validos.index[-1]}")
 
@@ -288,7 +276,7 @@ def main(ruta):
 
         if p_n is not None and u_n == "h" and p_n < -0.1:
             horas = max(ultimo["nivel_agua (%)"] - niv_on, 0) / -p_n
-            st.write(f"⏱️ Al ritmo actual ({-p_n:.1f} %/h) el tanque llegará a alerta en **~{horas:.1f} h**.")
+            st.write(f"⏱️ Al ritmo de ese momento ({-p_n:.1f} %/h) el tanque llegaría a alerta en **~{horas:.1f} h**.")
 
         st.subheader("Evolución con umbrales")
         g1, g2 = st.columns(2)
@@ -437,23 +425,38 @@ def main(ruta):
             st.write("### Sistema")
             st.write("- ESP32 · sensor de humedad (GPIO32) · sensor de nivel (GPIO33)")
             st.write("- Válvula: servo en GPIO13 · LEDs rojo/amarillo/verde")
-            st.write("- Datos: CirkitDesigner → InfluxDB → Grafana → CSV en GitHub → Streamlit")
+            st.write("- Datos: CirkitDesigner → InfluxDB → Grafana → CSV → Streamlit")
             st.write(f"- Registros: {len(df1)}")
             if con_tiempo and len(df1) > 0:
                 st.write(f"- Desde: {df1.index.min():%Y-%m-%d %H:%M}")
                 st.write(f"- Hasta: {df1.index.max():%Y-%m-%d %H:%M}")
 
 
-ruta_csv = buscar_csv()
-if ruta_csv is None:
-    st.error(f"No se encontró `{ARCHIVO_CSV}` en el repositorio.")
-    st.info("Exporte el CSV desde Grafana (panel → Inspect → Data → Download CSV), "
-            f"renómbrelo a `{ARCHIVO_CSV}` y súbalo a GitHub junto a app.py.")
+# ============================================================
+#  Cargar el CSV de Grafana: subir archivo o pegar el texto
+# ============================================================
+st.subheader("📥 CSV de Grafana")
+modo_subir, modo_pegar = st.tabs(["📁 Subir archivo", "📋 Pegar texto"])
+
+contenido, origen = None, None
+with modo_subir:
+    archivo = st.file_uploader("Arrastre aquí el CSV descargado de Grafana", type=["csv", "txt"])
+    if archivo is not None:
+        contenido, origen = archivo.getvalue(), archivo.name
+with modo_pegar:
+    texto = st.text_area("Pegue aquí el contenido del CSV", height=200,
+                         placeholder='"Time","humedad_suelo","nivel_agua"\n2026-11-21 13:20:00,46.6,0')
+    if texto.strip() and contenido is None:
+        contenido, origen = texto.strip().encode("utf-8"), "CSV pegado"
+
+if contenido is None:
+    st.info("En Grafana: menú del panel → **Inspect → Data** → activar *Series joined by time* "
+            "→ **Download CSV**. Luego súbalo o pegue su contenido aquí.")
 else:
     try:
-        main(ruta_csv)
+        main(leer_csv(contenido), origen)
     except Exception as e:
-        st.error(f"Error al procesar {ruta_csv.name}: {str(e)}")
+        st.error(f"Error al procesar el CSV: {e}")
         st.info("Verifique que el CSV de Grafana tenga las columnas humedad_suelo y nivel_agua.")
 
 st.markdown("""
