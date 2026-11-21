@@ -1,7 +1,17 @@
+import re
+from pathlib import Path
+
 import numpy as np
 import pandas as pd
 import altair as alt
 import streamlit as st
+
+# ============================================================
+#  Flujo: CirkitDesigner (ESP32) → InfluxDB → Grafana → CSV en GitHub → Streamlit
+#  El CSV exportado de Grafana se sube al repositorio con el nombre datos.csv
+# ============================================================
+ARCHIVO_CSV = "datos.csv"
+CARPETA = Path(__file__).parent
 
 st.set_page_config(page_title="Sprout - Riego Inteligente", page_icon="💧", layout="wide")
 
@@ -23,22 +33,44 @@ NIVEL_ALERTA_OFF = 29.18
 
 
 # ============================================================
-#  Lectura y preparación de datos
+#  Lectura del CSV de Grafana que está en el repositorio
 # ============================================================
-def leer_csv(archivo):
-    """Lee el CSV de Grafana o de InfluxDB (formato largo _time/_field/_value)."""
-    df = pd.read_csv(archivo, comment="#")
+def buscar_csv():
+    """Usa datos.csv; si no existe, el CSV más reciente de la carpeta del repo."""
+    principal = CARPETA / ARCHIVO_CSV
+    if principal.exists():
+        return principal
+    otros = sorted(CARPETA.glob("*.csv"), key=lambda p: p.stat().st_mtime, reverse=True)
+    return otros[0] if otros else None
+
+
+def limpiar_nombre(columna):
+    """Grafana nombra las series como 'tanque_planta humedad_suelo {device="ESP32"}'."""
+    nombre = re.sub(r"\s*\{.*\}\s*$", "", str(columna)).strip()
+    return re.split(r"[ .]", nombre)[-1] if nombre else nombre
+
+
+@st.cache_data(ttl=60)
+def leer_csv(ruta, _modificado):
+    df = pd.read_csv(ruta, sep=None, engine="python", comment="#")
     df = df.loc[:, ~df.columns.astype(str).str.startswith("Unnamed")]
 
+    # Formato largo de InfluxDB (_time, _field, _value)
     if {"_field", "_value"}.issubset(df.columns):
         df = df[df["_field"] != "_field"].copy()
         df["_value"] = pd.to_numeric(df["_value"], errors="coerce")
-        if "_time" in df.columns:
-            df = (df.pivot_table(index="_time", columns="_field",
-                                 values="_value", aggfunc="mean")
-                    .reset_index())
-            df.columns.name = None
+        df = df.pivot_table(index="_time", columns="_field", values="_value", aggfunc="mean").reset_index()
+        df.columns.name = None
 
+    # Formato largo de Grafana (Series, Time, Value)
+    minus = {str(c).lower(): c for c in df.columns}
+    if {"series", "time", "value"}.issubset(minus):
+        df = df.pivot_table(index=minus["time"], columns=minus["series"],
+                            values=minus["value"], aggfunc="mean").reset_index()
+        df.columns.name = None
+
+    df.columns = [limpiar_nombre(c) for c in df.columns]
+    df = df.loc[:, ~pd.Index(df.columns).duplicated()]
     return df.drop(columns=[c for c in METADATOS if c in df.columns])
 
 
@@ -49,8 +81,11 @@ def preparar_datos(df):
         (c for c in df.columns if str(c).strip().lower() in CANDIDATAS_TIEMPO), None
     )
     if col_tiempo is not None:
-        tiempo = pd.to_datetime(df[col_tiempo], errors="coerce")
-        if getattr(tiempo.dt, "tz", None) is not None:  # Influx guarda en UTC
+        if pd.api.types.is_numeric_dtype(df[col_tiempo]):
+            tiempo = pd.to_datetime(df[col_tiempo], unit="ms", errors="coerce", utc=True)  # epoch de Grafana
+        else:
+            tiempo = pd.to_datetime(df[col_tiempo], errors="coerce")
+        if getattr(tiempo.dt, "tz", None) is not None:
             tiempo = tiempo.dt.tz_convert("America/Bogota").dt.tz_localize(None)
         df[col_tiempo] = tiempo
         df = df.dropna(subset=[col_tiempo]).set_index(col_tiempo).sort_index()
@@ -58,6 +93,7 @@ def preparar_datos(df):
     else:
         df.index.name = "Registro"
 
+    # Texto que en realidad es número (p. ej. "23,5" o "45 %")
     for c in df.columns:
         if not pd.api.types.is_numeric_dtype(df[c]):
             texto = df[c].astype(str).str.replace(",", ".", regex=False)
@@ -171,9 +207,9 @@ def grafico_con_umbrales(serie, titulo, umbrales, con_tiempo):
 # ============================================================
 st.title("💧 Sprout · Interpretación del sistema de riego")
 st.markdown("""
-    Cargue el **CSV exportado de InfluxDB o Grafana** (bucket *Sprout*, medición *tanque_planta*).
-    La app interpreta la **humedad del suelo** y el **nivel de agua del tanque**, indica el estado
-    de cada uno, recomienda cuándo regar y genera un **CSV interpretado** para descargar.
+    **Flujo de datos:** CirkitDesigner (ESP32) → InfluxDB → Grafana → CSV en GitHub → Streamlit.
+    La app lee el CSV exportado de Grafana que está en el repositorio, interpreta la
+    **humedad del suelo** y el **nivel de agua del tanque** y recomienda cuándo regar.
 """)
 
 st.sidebar.header("⚙️ Umbrales (iguales al ESP32)")
@@ -184,20 +220,17 @@ niv_on, niv_off = st.sidebar.slider(
     "Nivel del tanque: alerta ON / OFF (%)", 0.0, 100.0, (NIVEL_ALERTA_ON, NIVEL_ALERTA_OFF), 0.5
 )
 
-uploaded_file = st.file_uploader("Seleccione archivo CSV", type=["csv"])
 
-
-def main(archivo):
-    df1, variables, col_tiempo = preparar_datos(leer_csv(archivo))
+def main(ruta):
+    df1, variables, col_tiempo = preparar_datos(leer_csv(str(ruta), ruta.stat().st_mtime))
     con_tiempo = col_tiempo is not None
 
     if not variables:
-        st.error("No se encontraron columnas numéricas en el archivo.")
+        st.error("El CSV no tiene columnas numéricas.")
         return
 
-    st.success(f"**{len(df1)}** registros · variables: " + ", ".join(f"`{v}`" for v in variables))
-    if not con_tiempo:
-        st.info("No se encontró columna de tiempo; se usará el número de registro como eje X.")
+    st.success(f"Datos de **{ruta.name}** · **{len(df1)}** registros · variables: "
+               + ", ".join(f"`{v}`" for v in variables))
 
     st.sidebar.header("🔌 Columnas del CSV")
     col_hum = st.sidebar.selectbox("Humedad del suelo (%)", variables,
@@ -404,21 +437,24 @@ def main(archivo):
             st.write("### Sistema")
             st.write("- ESP32 · sensor de humedad (GPIO32) · sensor de nivel (GPIO33)")
             st.write("- Válvula: servo en GPIO13 · LEDs rojo/amarillo/verde")
-            st.write("- Datos: ESP32 → InfluxDB (bucket Sprout) → Grafana / CSV")
+            st.write("- Datos: CirkitDesigner → InfluxDB → Grafana → CSV en GitHub → Streamlit")
             st.write(f"- Registros: {len(df1)}")
             if con_tiempo and len(df1) > 0:
                 st.write(f"- Desde: {df1.index.min():%Y-%m-%d %H:%M}")
                 st.write(f"- Hasta: {df1.index.max():%Y-%m-%d %H:%M}")
 
 
-if uploaded_file is not None:
-    try:
-        main(uploaded_file)
-    except Exception as e:
-        st.error(f"Error al procesar el archivo: {str(e)}")
-        st.info("Verifique que el CSV tenga las columnas humedad_suelo y nivel_agua.")
+ruta_csv = buscar_csv()
+if ruta_csv is None:
+    st.error(f"No se encontró `{ARCHIVO_CSV}` en el repositorio.")
+    st.info("Exporte el CSV desde Grafana (panel → Inspect → Data → Download CSV), "
+            f"renómbrelo a `{ARCHIVO_CSV}` y súbalo a GitHub junto a app.py.")
 else:
-    st.warning("Por favor, cargue un archivo CSV para comenzar el análisis.")
+    try:
+        main(ruta_csv)
+    except Exception as e:
+        st.error(f"Error al procesar {ruta_csv.name}: {str(e)}")
+        st.info("Verifique que el CSV de Grafana tenga las columnas humedad_suelo y nivel_agua.")
 
 st.markdown("""
     ---
